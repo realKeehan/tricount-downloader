@@ -8,6 +8,35 @@ import openpyxl
 import csv
 from tqdm import tqdm
 
+# -------- Paths behavior --------
+# If you prefer the current working directory, change BASE_DIR to os.getcwd().
+try:
+    BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+except NameError:
+    BASE_DIR = os.getcwd()  # fallback if running in an environment without __file__
+
+def _join_here(*parts) -> str:
+    return os.path.join(BASE_DIR, *parts)
+
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+# -------- Date parsing (robust) --------
+def _safe_date(date_str: str) -> str:
+    """
+    Return YYYY-MM-DD from various Tricount date string shapes.
+    Tries microseconds, then seconds, then fromisoformat. Falls back to original string.
+    """
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(date_str).strftime("%Y-%m-%d")
+    except Exception:
+        return date_str
+
 class TricountAPI:
     def __init__(self):
         self.base_url = "https://api.tricount.bunq.com"
@@ -45,22 +74,27 @@ class TricountAPI:
         return response.json()
 
 class TricountHandler:
+    # ---------- Parsing / Order ----------
     @staticmethod
     def get_tricount_title(data):
         return data["Response"][0]["Registry"]["title"]
 
     @staticmethod
     def parse_tricount_data(data):
+        """
+        Preserve original order:
+        - memberships in the order provided by the API
+        - transactions in the order provided by the API
+        """
         registry = data["Response"][0]["Registry"]
+
         memberships = [
-            {
-                "Name": m["RegistryMembershipNonUser"]["alias"]["display_name"],
-            }
+            {"Name": m["RegistryMembershipNonUser"]["alias"]["display_name"]}
             for m in registry["memberships"]
-        ]
+        ]  # DO NOT sort; keep original API order
 
         transactions = []
-        for entry in registry["all_registry_entry"]:
+        for entry in registry["all_registry_entry"]:  # original order
             transaction = entry["RegistryEntry"]
             type_transaction = transaction["type_transaction"]
             who_paid = transaction["membership_owned"]["RegistryMembershipNonUser"]["alias"]["display_name"]
@@ -71,7 +105,7 @@ class TricountHandler:
             shares = {
                 alloc["membership"]["RegistryMembershipNonUser"]["alias"]["display_name"]: abs(float(alloc["amount"]["value"]))
                 for alloc in transaction["allocations"]
-                }
+            }
             category = transaction["category"]
             attachments = transaction.get("attachment", [])
 
@@ -89,9 +123,12 @@ class TricountHandler:
 
         return memberships, transactions
 
+    # ---------- Attachments ----------
     @staticmethod
-    def download_attachments(transactions, download_folder):
-        os.makedirs(download_folder, exist_ok=True)
+    def download_attachments(transactions, download_folder_name):
+        download_folder = _join_here(download_folder_name)
+        _ensure_dir(download_folder)
+
         file_counter = 1
         total_files = sum(len(transaction["Attachments"]) for transaction in transactions)
         print(f"Total Attachments: {total_files}")
@@ -108,94 +145,87 @@ class TricountHandler:
                         extension = os.path.splitext(url.split("?")[0])[1] or ".file"
                         file_name = f"receipt_{file_counter}{extension}"
                         file_path = os.path.join(download_folder, file_name)
-                        TricountHandler.download_file(url, file_path)
+                        TricountHandler._download_file(url, file_path)
                         attachment_files.append(file_name)
                         file_counter += 1
                         progress_bar.update(1)
                 transaction["File Names"] = ", ".join(attachment_files)
 
     @staticmethod
-    def download_file(url, file_path):
+    def _download_file(url, file_path):
         response = requests.get(url)
         response.raise_for_status()
         with open(file_path, "wb") as file:
             file.write(response.content)
 
+    # ---------- Row preparation (order preserved) ----------
     @staticmethod
     def prepare_transaction_data(transaction):
         """
-        Helper method to prepare the data for each transaction.
-        Extracts involved people, formatted date, and attachment URLs.
+        Columns (fixed order):
+        Who Paid | Total | Currency | Description | When | Involved | File Names | Attachment URLs | Category
         """
-        # List of involved people involved in the transaction
         involved = ", ".join([name for name, amount in transaction["Shares"].items() if amount > 0])
-
-        # Prepare the row data for the transaction
         row_data = [
             transaction["Who Paid"],
             transaction["Total"],
             transaction["Currency"],
             transaction["Description"],
-            datetime.strptime(transaction["When"], "%Y-%m-%d %H:%M:%S.%f").strftime("%Y-%m-%d"),
+            _safe_date(transaction["When"]),
             involved,
             transaction.get("File Names", ""),
             ", ".join([attach["urls"][0]["url"] for attach in transaction["Attachments"] if "urls" in attach and attach["urls"]]),
             transaction["Category"]
         ]
-        
         return row_data
 
     @staticmethod
-    def prepare_sesterce_transaction_data(transaction, members):
+    def prepare_sesterce_transaction_data(transaction, members_in_original_order):
         """
-        Helper method to prepare the data for each transaction in the sesterce format.
-        A row contains: 
-        Date, Title, 
-        Paid by Member A, Paid by Member B, ... , 
-        Paid for Member A, Paid for Member B, ... ,
+        A row contains:
+        Date, Title,
+        Paid by Member A..N (original membership order),
+        Paid for Member A..N (original membership order),
         Currency, Category
         """
-        # create Paid by data
+        members = members_in_original_order  # keep original order
+
         paid_by = [0.0] * len(members)
         payer = transaction["Who Paid"]
-        paid_by[members.index(payer)] = transaction["Total"]
+        if payer in members:
+            paid_by[members.index(payer)] = transaction["Total"]
 
-        # create Paid for data
         paid_for = [0.0] * len(members)
-        # paid_for_member is the name of the person that is involved in the transaction and didn't pay
         for paid_for_member, amount in transaction["Shares"].items():
-            paid_for[members.index(paid_for_member)] = amount
+            if paid_for_member in members:
+                paid_for[members.index(paid_for_member)] = amount
 
-        # Determine the category based on the transaction type
         type_transaction = transaction["Type"]
-        category = ""  # Default empty
-
+        category = ""
         if type_transaction == "BALANCE":
             category = "Money Transfer"
         elif type_transaction == "INCOME":
-            # Negate paid_for values for income
             paid_for = [-amount for amount in paid_for]
             category = transaction["Category"] if transaction["Category"] != "UNCATEGORIZED" else ""
         elif type_transaction == "NORMAL":
-            # Use the category if present
             category = transaction["Category"] if transaction["Category"] != "UNCATEGORIZED" else ""
 
-
-
-        # Prepare the row data for the transaction
         row_data = [
-            datetime.strptime(transaction["When"], "%Y-%m-%d %H:%M:%S.%f").strftime("%Y-%m-%d"),
+            _safe_date(transaction["When"]),
             transaction["Description"],
             *paid_by,
             *paid_for,
             transaction["Currency"],
             category
         ]
-        
         return row_data
 
+    # ---------- Writers (save next to script; keep original filenames) ----------
     @staticmethod
     def write_to_excel(transactions, file_name):
+        """
+        Writes to {BASE_DIR}/{file_name}.xlsx
+        """
         workbook = openpyxl.Workbook()
         sheet = workbook.active
         sheet.title = "Tricount Transactions"
@@ -203,94 +233,76 @@ class TricountHandler:
         headers = ["Who Paid", "Total", "Currency", "Description", "When", "Involved", "File Names", "Attachment URLs", "Category"]
         sheet.append(headers)
 
-
         for transaction in transactions:
             row_data = TricountHandler.prepare_transaction_data(transaction)
             sheet.append(row_data)
 
-        workbook.save(f"{file_name}.xlsx")
-        print(f"Transactions have been saved to {file_name}.xlsx.")
+        xlsx_path = _join_here(f"{file_name}.xlsx")
+        workbook.save(xlsx_path)
+        print(f"Transactions have been saved to {xlsx_path}.")
 
     @staticmethod
     def write_to_csv(transactions, file_name):
         """
-        Writes transaction data to a CSV file with the given file name.
-
-        Parameters:
-        - transactions (list): A list of transaction data.
-        - file_name (str): The name of the CSV file to save the data to (without the .csv extension).
-
-        The CSV file will have the following headers:
-        "Who Paid", "Total", "Currency", "Description", "When", "Involved", "File Names", "Attachment URLs", "Category"
-
-        Each transaction will be processed by the `prepare_transaction_data` method and written to the file.
+        Semicolon-delimited CSV (same as original), UTF-8 with BOM so Excel shows Unicode correctly.
+        Saves to {BASE_DIR}/{file_name}.csv
         """
-        with open(f"{file_name}.csv", "w") as csvfile:
+        csv_path = _join_here(f"{file_name}.csv")
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as csvfile:
             headers = ["Who Paid", "Total", "Currency", "Description", "When", "Involved", "File Names", "Attachment URLs", "Category"]
-            transaction_writer = csv.writer(csvfile, delimiter=";")
-            transaction_writer.writerow(headers)
-
-            # Iterate through each transaction and write its data to the CSV file
+            writer = csv.writer(csvfile, delimiter=";")
+            writer.writerow(headers)
             for transaction in transactions:
                 row_data = TricountHandler.prepare_transaction_data(transaction)
-                transaction_writer.writerow(row_data)
-
-            print(f"Transactions have been saved to {file_name}.csv.")
+                writer.writerow(row_data)
+        print(f"Transactions have been saved to {csv_path}.")
 
     @staticmethod
     def write_to_sesterce_csv(memberships, transactions, file_name):
         """
-        Writes transaction data in a specific format for Sesterce to a CSV file with the given file name.
-
-        Parameters:
-        - memberships (list): A list of memberships where each membership is a dictionary containing a "Name" key.
-        - transactions (list): A list of transaction data.
-        - file_name (str): The name of the CSV file to save the data to (without the .csv extension).
-
-        The CSV file will have the following headers:
-        "Date", "Title", "Paid by member" for each member, "Paid for member" for each member, "Currency", "Category"
-
-        Each transaction will be processed by the `prepare_sesterce_transaction_data` method and written to the file.
+        Comma-delimited, UTF-8 with BOM, **original member order** (no sorting).
+        Saves to {BASE_DIR}/{file_name}.csv
         """
-        # Sort members alphabetically based on their "Name"
-        members = sorted([member["Name"] for member in memberships])
+        members_in_original_order = [member["Name"] for member in memberships]  # DO NOT sort
 
-        with open(f"{file_name}.csv", "w") as csvfile:
-            headers = ["Date", "Title"] + [f"Paid by {member}" for member in members] + [f"Paid for {member}" for member in members] + ["Currency", "Category"]
-            transaction_writer = csv.writer(csvfile, delimiter=",")  # Sesterce expects "," delimiter
-            transaction_writer.writerow(headers)
-
-            # Iterate through each transaction and write its data to the CSV file
+        csv_path = _join_here(f"{file_name}.csv")
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as csvfile:
+            headers = (
+                ["Date", "Title"]
+                + [f"Paid by {m}" for m in members_in_original_order]
+                + [f"Paid for {m}" for m in members_in_original_order]
+                + ["Currency", "Category"]
+            )
+            writer = csv.writer(csvfile, delimiter=",")
+            writer.writerow(headers)
             for transaction in transactions:
-                row_data = TricountHandler.prepare_sesterce_transaction_data(transaction, members)
-                transaction_writer.writerow(row_data)
-
-            print(f"Transactions have been saved to {file_name}.csv.")
-
+                row_data = TricountHandler.prepare_sesterce_transaction_data(transaction, members_in_original_order)
+                writer.writerow(row_data)
+        print(f"Transactions have been saved to {csv_path}.")
 
 if __name__ == "__main__":
-    # example key
+    # example key (replace with yours)
     tricount_key = "tISWyMCgrIMgFuxudZ"
 
     api = TricountAPI()
     api.authenticate()
     data = api.fetch_tricount_data(tricount_key)
 
-    # save data to local file
-    with open('response_data.json', 'w') as f:
-        json.dump(data, f, indent=2)
-
-    # load data from local file
-    #with open('response_data.json', 'r') as f:
-    #    data = json.load(f)
+    # save data to local file next to the script (original intended folder)
+    response_json_path = _join_here("response_data.json")
+    with open(response_json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"Wrote raw JSON to {response_json_path}")
 
     handler = TricountHandler()
     tricount_title = handler.get_tricount_title(data)
 
     memberships, transactions = handler.parse_tricount_data(data)
 
+    # CSV in original order, saved next to the script
     handler.write_to_csv(transactions, file_name=f"Transactions {tricount_title}")
 
-    #handler.write_to_excel(transactions, file_name=f"Transactions {tricount_title}")
-    #handler.write_to_sesterce_csv(memberships, transactions, f"Transaction {tricount_title} (Sesterce)")
-    #handler.download_attachments(transactions, download_folder=f"Attachments {tricount_title}")
+    # Optional extras (same folder & original names):
+    # handler.write_to_excel(transactions, file_name=f"Transactions {tricount_title}")
+    # handler.write_to_sesterce_csv(memberships, transactions, f"Transaction {tricount_title} (Sesterce)")
+    # handler.download_attachments(transactions, download_folder_name=f"Attachments {tricount_title}")
